@@ -186,6 +186,13 @@ public:
       std::chrono::duration_cast<std::chrono::milliseconds>(period),
       std::bind(&MotorSerialBridgeNode::onControlTimer, this));
 
+    // Keep all internal timestamps on the same clock source as now().
+    const auto t0 = now();
+    last_connect_attempt_ = t0;
+    last_cmd_time_ = t0;
+    last_odom_time_ = t0;
+    latest_feedback_.stamp = t0;
+
     read_thread_ = std::thread(&MotorSerialBridgeNode::readLoop, this);
 
     RCLCPP_INFO(get_logger(), "motor_serial_bridge_node started. port=%s baud=%d mode=%s",
