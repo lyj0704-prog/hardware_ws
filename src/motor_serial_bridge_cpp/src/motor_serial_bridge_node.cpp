@@ -339,10 +339,17 @@ private:
     }
 
     const auto t_now = now();
-    if ((t_now - last_connect_attempt_).nanoseconds() / 1000000LL < reconnect_period_ms_) {
-      return false;
+    {
+      std::lock_guard<std::mutex> lock(serial_mutex_);
+      if (serial_fd_ >= 0) {
+        serial_connected_.store(true);
+        return true;
+      }
+      if ((t_now - last_connect_attempt_).nanoseconds() / 1000000LL < reconnect_period_ms_) {
+        return false;
+      }
+      last_connect_attempt_ = t_now;
     }
-    last_connect_attempt_ = t_now;
 
     const int fd = open(port_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) {
@@ -382,6 +389,11 @@ private:
 
     {
       std::lock_guard<std::mutex> lock(serial_mutex_);
+      if (serial_fd_ >= 0) {
+        close(fd);
+        serial_connected_.store(true);
+        return true;
+      }
       serial_fd_ = fd;
       rx_buffer_.clear();
     }
@@ -407,8 +419,29 @@ private:
       return false;
     }
 
-    const ssize_t sent = write(serial_fd_, line.data(), line.size());
-    if (sent < 0 || static_cast<size_t>(sent) != line.size()) {
+    size_t total_sent = 0;
+    int eagain_retries = 0;
+    while (total_sent < line.size()) {
+      const ssize_t sent = write(serial_fd_, line.data() + total_sent, line.size() - total_sent);
+      if (sent > 0) {
+        total_sent += static_cast<size_t>(sent);
+        eagain_retries = 0;
+        continue;
+      }
+      if (sent == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (++eagain_retries <= 5) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          continue;
+        }
+        break;
+      }
+      if (errno == EINTR) {
+        continue;
+      }
+      break;
+    }
+
+    if (total_sent != line.size()) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Serial write failed: %s",
         std::strerror(errno));
       if (serial_fd_ >= 0) {
@@ -465,21 +498,28 @@ private:
 
   void appendRxData(const std::string & chunk)
   {
-    std::lock_guard<std::mutex> lock(serial_mutex_);
-    rx_buffer_.append(chunk);
+    std::vector<std::string> lines;
+    {
+      std::lock_guard<std::mutex> lock(serial_mutex_);
+      rx_buffer_.append(chunk);
 
-    size_t newline_pos = std::string::npos;
-    while ((newline_pos = rx_buffer_.find('\n')) != std::string::npos) {
-      std::string line = rx_buffer_.substr(0, newline_pos);
-      rx_buffer_.erase(0, newline_pos + 1);
-      line = trimLine(line);
-      if (!line.empty()) {
-        parseFeedbackLine(line);
+      size_t newline_pos = std::string::npos;
+      while ((newline_pos = rx_buffer_.find('\n')) != std::string::npos) {
+        std::string line = rx_buffer_.substr(0, newline_pos);
+        rx_buffer_.erase(0, newline_pos + 1);
+        line = trimLine(line);
+        if (!line.empty()) {
+          lines.push_back(std::move(line));
+        }
+      }
+
+      if (rx_buffer_.size() > 4096) {
+        rx_buffer_.clear();
       }
     }
 
-    if (rx_buffer_.size() > 4096) {
-      rx_buffer_.clear();
+    for (const auto & line : lines) {
+      parseFeedbackLine(line);
     }
   }
 
