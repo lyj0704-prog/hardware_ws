@@ -156,7 +156,7 @@ public:
       joint_state_pub_ = create_publisher<sensor_msgs::msg::JointState>("/joint_states", 20);
     }
     if (publish_wheel_ticks_) {
-      wheel_ticks_pub_ = create_publisher<std_msgs::msg::Int64MultiArray>("/wheel_ticks", 20);
+      wheel_ticks_pub_ = create_publisher<std_msgs::msg::Int64MultiArray>("/wheel_ticks", 20); 
     }
     if (publish_diagnostics_) {
       diagnostics_pub_ =

@@ -3,7 +3,7 @@ motor_serial_bridge_node:
     port: "/dev/ttyTHS1"  # e.g. /dev/ttyTHS1, /dev/ttyAMA0, /dev/ttyUSB0
     baud: 115200
     publish_rate_hz: 75.0
-    cmd_timeout_ms: 200
+    cmd_timeout_ms: 500
 
     base_frame: "base_link"
     odom_frame: "odom"
@@ -13,7 +13,7 @@ motor_serial_bridge_node:
     ticks_per_rev: 2048
 
     max_speed_mps: 5.0
-    max_steer_rad: 0.45
+    max_steer_rad: 0.24
 
     drive_model: "ackermann"
     command_mode: "mps_rad"    # "mps_rad" or "pwm_servo_us"
