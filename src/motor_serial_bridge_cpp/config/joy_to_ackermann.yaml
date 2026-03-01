@@ -1,0 +1,23 @@
+joy_to_ackermann_node:
+  ros__parameters:
+    joy_left_topic: "/joy_left"
+    joy_right_topic: "/joy_right"
+    ackermann_topic: "/ackermann_cmd"
+    frame_id: "base_link"
+
+    # JoyCon L horizontal stick axis
+    steering_axis_index: 0
+    # JoyCon R A button index in /joy_right.buttons
+    forward_button_index: 1
+    # Set -1 to disable reverse
+    reverse_button_index: -1
+
+    max_steer_rad: 0.24
+    forward_speed_mps: 0.2
+    reverse_speed_mps: 0.5
+    steering_deadzone: 0.05
+    invert_steering: false
+
+    publish_rate_hz: 30.0
+    joy_timeout_ms: 300
+    hold_last_steering_on_timeout: false

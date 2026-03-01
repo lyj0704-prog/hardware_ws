@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>motor_serial_bridge_cpp</name>
+  <version>0.1.0</version>
+  <description>UART bridge between ROS2 and ESP32 motor controller for F1TENTH.</description>
+  <maintainer email="you@todo.com">you</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>ackermann_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
