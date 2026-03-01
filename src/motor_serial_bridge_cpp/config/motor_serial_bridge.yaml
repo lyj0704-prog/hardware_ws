@@ -1,0 +1,46 @@
+motor_serial_bridge_node:
+  ros__parameters:
+    port: "/dev/ttyTHS1"  # e.g. /dev/ttyTHS1, /dev/ttyAMA0, /dev/ttyUSB0
+    baud: 115200
+    publish_rate_hz: 75.0
+    cmd_timeout_ms: 500
+
+    base_frame: "base_link"
+    odom_frame: "odom"
+
+    wheel_base_m: 0.33
+    wheel_radius_m: 0.05
+    ticks_per_rev: 2048
+
+    max_speed_mps: 5.0
+    max_steer_rad: 0.23
+
+    drive_model: "ackermann"
+    command_mode: "mps_rad"    # "mps_rad" or "pwm_servo_us"
+
+    pwm_min: 1000
+    pwm_max: 2000
+    steer_center_us: 1500
+    steer_left_us: 1900
+    steer_right_us: 1100
+
+    invert_drive: false
+    use_measured_steer: false
+    debug_print: false
+
+    ackermann_topic: "/ackermann_cmd"
+    enable_cmd_vel: false
+    cmd_vel_topic: "/cmd_vel"
+    emergency_stop_topic: "/emergency_stop"
+    allow_estop_release: true
+
+    publish_odom: true
+    publish_tf: true
+    publish_joint_states: true
+    publish_wheel_ticks: true
+    publish_diagnostics: true
+
+    drive_wheel_joint_name: "drive_wheel_joint"
+    steering_joint_name: "steering_joint"
+
+    reconnect_period_ms: 1000
