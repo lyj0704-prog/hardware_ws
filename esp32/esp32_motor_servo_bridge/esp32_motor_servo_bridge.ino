@@ -14,10 +14,9 @@ const int ENA = 14;
 const int IN1 = 27;      // motor PWM
 const int IN2 = 26;      // motor DIR
 const int SERVO_PIN = 33;  // steering servo signal (yellow)
-const int ENC_A_PIN = 34;  // wheel encoder pulse input
-const int ENC_B_PIN = 35;  // quadrature B pin
+const int ENC_A_PIN = 35;  // wheel encoder pulse input
+const int ENC_B_PIN = 34;  // quadrature B pin
 const bool ENC_INVERT_SIGN = false;
-const bool ENC_COUNT_RISING_EDGE = true;
 
 // UART2 (ESP32)
 const int ESP_RX = 16;   // <- Jetson TX
@@ -85,6 +84,7 @@ volatile int currentPwm = 0;
 // Encoder calibration: replace with measured value.
 float ENC_COUNTS_PER_METER = 541.1f;
 volatile int32_t encCount = 0;
+volatile uint8_t encPrevState = 0;
 
 unsigned long lastCmdMs = 0;
 unsigned long lastFbMs = 0;
@@ -103,26 +103,23 @@ const unsigned long CMD_TIMEOUT_MS = 300;
 const unsigned long FB_PERIOD_MS = 50; // 20Hz feedback
 
 void IRAM_ATTR onEncoderEdge() {
-  int dir = 0;
-  const int pwm_snapshot = currentPwm;
-  if (pwm_snapshot > 0) {
-    dir = 1;
-  } else if (pwm_snapshot < 0) {
-    dir = -1;
-  }
+  static const int8_t QUAD_TABLE[16] = {
+      0, -1, +1, 0,
+      +1, 0, 0, -1,
+      -1, 0, 0, +1,
+      0, +1, -1, 0};
 
-  const int a = digitalRead(ENC_A_PIN);
-  const int b = digitalRead(ENC_B_PIN);
-  dir = (a == b) ? 1 : -1;
-  if (pwm_snapshot < 0) {
-    dir = -dir;
-  }
+  const uint8_t a = (uint8_t)digitalRead(ENC_A_PIN);
+  const uint8_t b = (uint8_t)digitalRead(ENC_B_PIN);
+  const uint8_t curr = (uint8_t)((a << 1) | b);
+  const uint8_t idx = (uint8_t)((encPrevState << 2) | curr);
+  int8_t step = QUAD_TABLE[idx];
+  encPrevState = curr;
+
   if (ENC_INVERT_SIGN) {
-    dir = -dir;
+    step = -step;
   }
-  if (dir != 0) {
-    encCount += dir;
-  }
+  encCount += step;
 }
 
 // ---------------- Helpers ----------------
@@ -519,8 +516,9 @@ void setup() {
   digitalWrite(ENA, HIGH);
   pinMode(ENC_A_PIN, INPUT);
   pinMode(ENC_B_PIN, INPUT);
-  attachInterrupt(digitalPinToInterrupt(ENC_A_PIN), onEncoderEdge,
-                  ENC_COUNT_RISING_EDGE ? RISING : FALLING);
+  encPrevState = (uint8_t)((digitalRead(ENC_A_PIN) << 1) | digitalRead(ENC_B_PIN));
+  attachInterrupt(digitalPinToInterrupt(ENC_A_PIN), onEncoderEdge, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_B_PIN), onEncoderEdge, CHANGE);
 
   // Motor PWM on IN1
   ledcAttach(IN1, PWM_FREQ, PWM_RES);
