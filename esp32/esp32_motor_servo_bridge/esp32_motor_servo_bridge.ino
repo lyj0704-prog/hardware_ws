@@ -4,10 +4,20 @@
 // TX: "FB vel_mps=0.48 steer=0.10 enc=12345 fault=0"
 //
 // Hardware:
-// - 1 DC motor (IN1=PWM, IN2=DIR, ENA=enable)
+// - 1 DC motor (IN1=PWM, IN2=DIR, ENA=enable)  [L298N]
 // - 1 steering servo on GPIO33
+//
+// v2 changes (software-only, no hardware change):
+//   [1] PWM 8-bit → 10-bit (256 → 1024 steps)
+//   [2] Encoder ISR: digitalRead → direct register read
+//   [3] Speed measurement synced with PID period (20ms)
+//   [4] Time-based PWM ramping (loop-speed independent)
+//   [5] Active brake + dwell before direction reversal
+//   [6] Critical section: noInterrupts → portENTER_CRITICAL
+//   [7] Shadow register for ledcWrite (skip redundant writes)
 
 #include <HardwareSerial.h>
+#include <soc/gpio_struct.h>   // GPIO.in1.val direct register
 
 // ---------------- Pins ----------------
 const int ENA = 14;
@@ -24,9 +34,10 @@ const int ESP_TX = 17;   // -> Jetson RX
 HardwareSerial JetsonSerial(2);
 
 // ---------------- Motor PWM ----------------
-const int PWM_FREQ = 20000;
-const int PWM_RES = 8;     // 0~255
-const int PWM_MAX = 255;
+// [1] 10-bit resolution: 0~1023 (was 8-bit 0~255)
+const int PWM_FREQ = 4500;
+const int PWM_RES = 10;     // 0~1023
+const int PWM_MAX = 1023;
 
 // ---------------- Servo PWM ----------------
 // 50 Hz standard servo pulse
@@ -46,30 +57,36 @@ const bool INVERT_STEER_SIGN = true;
 float MAX_STEER_RAD = 0.15f;
 
 // ---------------- Tuning ----------------
+// [1] All PWM constants scaled ×4 for 10-bit
 // Must match ROS-side max_speed_mps in yaml
 float MAX_SPEED_MPS = 1.0f;
-int MIN_EFFECTIVE_PWM_FWD = 80;
-int MIN_EFFECTIVE_PWM_REV = 45;
-int MAX_USE_PWM_FWD = 220;
-int MAX_USE_PWM_REV = 70;
-int PWM_RAMP_STEP = 5;  // per control update
-int START_BOOST_PWM_FWD = 120;
-int START_BOOST_PWM_REV = 55;
+int MIN_EFFECTIVE_PWM_FWD = 320;   // was 80
+int MIN_EFFECTIVE_PWM_REV = 240;   // was 60
+int MAX_USE_PWM_FWD = 800;         // was 200
+int MAX_USE_PWM_REV = 440;         // was 110
+int START_BOOST_PWM_FWD = 480;     // was 120
+int START_BOOST_PWM_REV = 360;     // was 90
 const unsigned long START_BOOST_MS = 140;
+
+// [4] Time-based ramp: PWM units per second (replaces fixed PWM_RAMP_STEP)
+float PWM_RAMP_RATE = 3000.0f;     // ~0.33s from 0 to full (was ~5/loop ≈ irregular)
+
+// [5] Brake dwell: hold brake this long before allowing direction reversal
+const unsigned long BRAKE_DWELL_MS = 80;
 
 bool DIR_IN2_HIGH_IS_REVERSE = true;
 
 // ---------------- Speed PID ----------------
-// Feedforward(speed->PWM) + PID correction.
+// [1] Gains & clamps scaled ×4 for 10-bit PWM output
 const bool ENABLE_SPEED_PID = true;
 const unsigned long SPEED_PID_PERIOD_MS = 20;  // 50 Hz control loop
-float SPEED_KP = 60.0f;
-float SPEED_KI = 20.0f;
-float SPEED_KD = 2.0f;
-float SPEED_PID_I_CLAMP = 80.0f;
-float SPEED_PID_D_LPF_ALPHA = 0.7f;            // 0.0: no filtering, 1.0: heavy filtering
-float SPEED_PID_MAX_CORR_FWD = 70.0f;          // max + correction pwm
-float SPEED_PID_MAX_CORR_REV = 50.0f;          // max - correction pwm
+float SPEED_KP = 240.0f;                       // was 60
+float SPEED_KI = 80.0f;                        // was 20
+float SPEED_KD = 8.0f;                         // was 2
+float SPEED_PID_I_CLAMP = 320.0f;              // was 80
+float SPEED_PID_D_LPF_ALPHA = 0.7f;
+float SPEED_PID_MAX_CORR_FWD = 280.0f;         // was 70
+float SPEED_PID_MAX_CORR_REV = 200.0f;         // was 50
 
 // ---------------- State ----------------
 String rxLine;
@@ -86,6 +103,9 @@ float ENC_COUNTS_PER_METER = 541.1f;
 volatile int32_t encCount = 0;
 volatile uint8_t encPrevState = 0;
 
+// [6] Critical section mutex (replaces noInterrupts/interrupts)
+portMUX_TYPE encMux = portMUX_INITIALIZER_UNLOCKED;
+
 unsigned long lastCmdMs = 0;
 unsigned long lastFbMs = 0;
 unsigned long startBoostUntilMs = 0;
@@ -98,10 +118,28 @@ float speedPidIntegral = 0.0f;
 float speedPidPrevError = 0.0f;
 float speedPidDerivFilt = 0.0f;
 
+// [3] Independent encoder snapshot for PID velocity
+int32_t pidPrevEnc = 0;
+bool pidHasPrevEnc = false;
+
+// [4] Time-based ramp state
+unsigned long lastRampMs = 0;
+
+// [5] Brake dwell state
+bool brakeDwellActive = false;
+unsigned long brakeDwellUntilMs = 0;
+
+// [7] Shadow registers for ledcWrite (skip redundant writes)
+uint32_t shadowIN1 = 0;
+uint32_t shadowServo = 0;
+
 // ESP32-side safety timeout (independent of Jetson timeout)
 const unsigned long CMD_TIMEOUT_MS = 300;
 const unsigned long FB_PERIOD_MS = 50; // 20Hz feedback
 
+// ================================================================
+//  [2] Encoder ISR — direct register read (GPIO 34, 35 are in GPIO.in1)
+// ================================================================
 void IRAM_ATTR onEncoderEdge() {
   static const int8_t QUAD_TABLE[16] = {
       0, -1, +1, 0,
@@ -109,8 +147,12 @@ void IRAM_ATTR onEncoderEdge() {
       -1, 0, 0, +1,
       0, +1, -1, 0};
 
-  const uint8_t a = (uint8_t)digitalRead(ENC_A_PIN);
-  const uint8_t b = (uint8_t)digitalRead(ENC_B_PIN);
+  // [2] Direct register read: GPIO 32-39 → GPIO.in1.val
+  // GPIO 34 = bit 2, GPIO 35 = bit 3
+  const uint32_t reg = GPIO.in1.val;
+  const uint8_t a = (uint8_t)((reg >> (ENC_A_PIN - 32)) & 1);  // bit 3
+  const uint8_t b = (uint8_t)((reg >> (ENC_B_PIN - 32)) & 1);  // bit 2
+
   const uint8_t curr = (uint8_t)((a << 1) | b);
   const uint8_t idx = (uint8_t)((encPrevState << 2) | curr);
   int8_t step = QUAD_TABLE[idx];
@@ -122,10 +164,28 @@ void IRAM_ATTR onEncoderEdge() {
   encCount += step;
 }
 
-// ---------------- Helpers ----------------
+// ================================================================
+//  [7] Shadow-guarded ledcWrite helpers
+// ================================================================
+static inline void safeWriteIN1(uint32_t duty) {
+  if (duty != shadowIN1) {
+    ledcWrite(IN1, duty);
+    shadowIN1 = duty;
+  }
+}
+
+static inline void safeWriteServo(uint32_t duty) {
+  if (duty != shadowServo) {
+    ledcWrite(SERVO_PIN, duty);
+    shadowServo = duty;
+  }
+}
+
+// ================================================================
+//  Helpers
+// ================================================================
 int usToDuty(int us) {
   us = constrain(us, SERVO_MIN_US, SERVO_MAX_US);
-  // duty = (us / period_us) * (2^res - 1), period_us = 20000 at 50Hz
   const uint32_t dutyMax = (1UL << SERVO_RES) - 1UL;
   return (int)(((uint32_t)us * dutyMax) / 20000UL);
 }
@@ -136,14 +196,13 @@ void writeServoUs(int us) {
     return;
   }
   cmdSteerUs = targetUs;
-  ledcWrite(SERVO_PIN, usToDuty(cmdSteerUs));
+  safeWriteServo(usToDuty(cmdSteerUs));   // [7] shadow guard
 }
 
 int steerRadToUs(float steerRad) {
   float s = constrain(steerRad, -MAX_STEER_RAD, MAX_STEER_RAD);
   if (MAX_STEER_RAD <= 1e-6f) return SERVO_CENTER_US;
 
-  // Match ROS default polarity in yaml: left(+) => larger us
   if (s >= 0.0f) {
     float t = s / MAX_STEER_RAD;
     return (int)(SERVO_CENTER_US + t * (SERVO_LEFT_US - SERVO_CENTER_US));
@@ -152,34 +211,86 @@ int steerRadToUs(float steerRad) {
   return (int)(SERVO_CENTER_US + t * (SERVO_RIGHT_US - SERVO_CENTER_US));
 }
 
+// ================================================================
+//  [5] Motor output with brake dwell & [4] time-based ramp
+// ================================================================
 void setMotorOutput(int signedPwm) {
+  const unsigned long nowMs = millis();
+
+  // ---- [5] Brake dwell: if active, hold brake until timer expires ----
+  if (brakeDwellActive) {
+    if (nowMs < brakeDwellUntilMs) {
+      // Still dwelling — keep brake (IN1 LOW + IN2 LOW + ENA HIGH = L298N short brake)
+      safeWriteIN1(0);
+      digitalWrite(IN2, LOW);
+      currentPwm = 0;
+      motorRunning = false;
+      return;
+    }
+    // Dwell complete
+    brakeDwellActive = false;
+  }
+
+  // Clamp to allowed range
   if (signedPwm > 0) {
     signedPwm = constrain(signedPwm, 0, MAX_USE_PWM_FWD);
   } else if (signedPwm < 0) {
     signedPwm = constrain(signedPwm, -MAX_USE_PWM_REV, 0);
   }
 
+  // Apply minimum effective PWM
   if (signedPwm > 0 && signedPwm < MIN_EFFECTIVE_PWM_FWD) {
     signedPwm = MIN_EFFECTIVE_PWM_FWD;
   } else if (signedPwm < 0 && (-signedPwm) < MIN_EFFECTIVE_PWM_REV) {
     signedPwm = -MIN_EFFECTIVE_PWM_REV;
   }
 
-  // Short start boost to break static friction from standstill.
+  // ---- [5] Detect direction reversal → enter brake dwell ----
+  if (currentPwm != 0 && signedPwm != 0) {
+    bool wasForward = (currentPwm > 0);
+    bool wantForward = (signedPwm > 0);
+    if (wasForward != wantForward) {
+      // Direction change at non-zero speed: brake first
+      safeWriteIN1(0);
+      digitalWrite(IN2, LOW);
+      currentPwm = 0;
+      motorRunning = false;
+      startBoostUntilMs = 0;
+      startBoostSign = 0;
+      brakeDwellActive = true;
+      brakeDwellUntilMs = nowMs + BRAKE_DWELL_MS;
+      lastRampMs = nowMs;
+      return;
+    }
+  }
+
+  // Start boost for breaking static friction from standstill
   if (currentPwm == 0 && signedPwm != 0) {
     startBoostSign = (signedPwm > 0) ? 1 : -1;
-    startBoostUntilMs = millis() + START_BOOST_MS;
+    startBoostUntilMs = nowMs + START_BOOST_MS;
   }
 
+  // ---- [4] Time-based ramping ----
   int targetPwm = signedPwm;
-  int delta = targetPwm - currentPwm;
-  if (delta > PWM_RAMP_STEP) {
-    targetPwm = currentPwm + PWM_RAMP_STEP;
-  } else if (delta < -PWM_RAMP_STEP) {
-    targetPwm = currentPwm - PWM_RAMP_STEP;
+  if (lastRampMs > 0) {
+    const unsigned long dtMs = nowMs - lastRampMs;
+    if (dtMs > 0) {
+      const float maxDelta = PWM_RAMP_RATE * (float)dtMs * 0.001f;
+      const int iMaxDelta = (int)maxDelta;
+      if (iMaxDelta > 0) {
+        int delta = targetPwm - currentPwm;
+        if (delta > iMaxDelta) {
+          targetPwm = currentPwm + iMaxDelta;
+        } else if (delta < -iMaxDelta) {
+          targetPwm = currentPwm - iMaxDelta;
+        }
+      }
+    }
   }
+  lastRampMs = nowMs;
 
-  if (millis() < startBoostUntilMs) {
+  // Apply start boost (override ramp if still in boost window)
+  if (nowMs < startBoostUntilMs) {
     if (startBoostSign > 0) {
       if (targetPwm < START_BOOST_PWM_FWD) {
         targetPwm = START_BOOST_PWM_FWD;
@@ -191,9 +302,10 @@ void setMotorOutput(int signedPwm) {
     }
   }
 
+  // ---- Stop ----
   if (targetPwm == 0) {
-    ledcWrite(IN1, 0);
-    digitalWrite(IN2, LOW);
+    safeWriteIN1(0);          // [7] shadow guard
+    digitalWrite(IN2, LOW);   // IN1=LOW, IN2=LOW, ENA=HIGH → L298N short brake
     currentPwm = 0;
     motorRunning = false;
     startBoostUntilMs = 0;
@@ -201,6 +313,7 @@ void setMotorOutput(int signedPwm) {
     return;
   }
 
+  // ---- Drive ----
   bool reverse = targetPwm < 0;
   int pwm = abs(targetPwm);
 
@@ -210,7 +323,7 @@ void setMotorOutput(int signedPwm) {
     digitalWrite(IN2, reverse ? LOW : HIGH);
   }
 
-  ledcWrite(IN1, pwm);
+  safeWriteIN1(pwm);           // [7] shadow guard
   currentPwm = reverse ? -pwm : pwm;
   motorRunning = true;
 }
@@ -219,11 +332,15 @@ void stopMotor() {
   setMotorOutput(0);
 }
 
+// ================================================================
+//  Speed PID
+// ================================================================
 void resetSpeedPid() {
   speedPidIntegral = 0.0f;
   speedPidPrevError = 0.0f;
   speedPidDerivFilt = 0.0f;
   lastSpeedPidMs = 0;
+  pidHasPrevEnc = false;
 }
 
 float computeSpeedPidCorrection(float targetMps, float currentMps, float dtSec) {
@@ -262,6 +379,9 @@ int speedMpsToPwm(float speedMps) {
   return -(int)(norm * MAX_USE_PWM_REV);
 }
 
+// ================================================================
+//  Parsing
+// ================================================================
 bool parseIntField(const String& line, const char* key, int& out) {
   String k = String(key) + "=";
   int idx = line.indexOf(k);
@@ -296,6 +416,9 @@ bool parseFloatField(const String& line, const char* key, float& out) {
   return true;
 }
 
+// ================================================================
+//  Command handlers
+// ================================================================
 // command_mode = mps_rad
 void handleCmdMpsRad(const String& line) {
   float spd = cmdSpeedMps;
@@ -342,7 +465,6 @@ void handleCmdPwmServo(const String& line) {
 
   if (hasSteerUs) {
     writeServoUs(steerUs);
-    // keep a rough rad echo for FB readability
     cmdSteerRad = ((float)(cmdSteerUs - SERVO_CENTER_US) / 400.0f) * MAX_STEER_RAD;
   }
 
@@ -360,7 +482,7 @@ void handleCmdPwmServo(const String& line) {
   resetSpeedPid();
 
   if (hasPwm) {
-    // ROS pwm is commonly 1000~2000 with 1500 neutral
+    // [1] ROS pwm 1000~2000 → scaled to 10-bit range
     int signedPwm = 0;
     if (pwm > 1500) {
       signedPwm = map(pwm, 1501, 2000, 0, MAX_USE_PWM_FWD);
@@ -371,12 +493,20 @@ void handleCmdPwmServo(const String& line) {
   }
 }
 
+// ================================================================
+//  [3] Speed controller — measures velocity in sync with PID
+// ================================================================
 void runSpeedController() {
   if (!speedControlActive || estopLatched) return;
 
   const unsigned long nowMs = millis();
   if (lastSpeedPidMs == 0) {
     lastSpeedPidMs = nowMs;
+    // [3] Initialize PID encoder snapshot
+    portENTER_CRITICAL(&encMux);
+    pidPrevEnc = encCount;
+    portEXIT_CRITICAL(&encMux);
+    pidHasPrevEnc = true;
     return;
   }
 
@@ -384,17 +514,36 @@ void runSpeedController() {
   if (elapsedMs < SPEED_PID_PERIOD_MS) return;
   lastSpeedPidMs = nowMs;
 
+  // [3] Measure velocity at PID rate (not at FB rate)
+  int32_t encSnap;
+  portENTER_CRITICAL(&encMux);       // [6] proper critical section
+  encSnap = encCount;
+  portEXIT_CRITICAL(&encMux);
+
+  float pidMeasuredVel = 0.0f;
+  if (pidHasPrevEnc && ENC_COUNTS_PER_METER > 1e-4f) {
+    const float dtSec = (float)elapsedMs * 0.001f;
+    const int32_t dCount = encSnap - pidPrevEnc;
+    pidMeasuredVel = ((float)dCount / ENC_COUNTS_PER_METER) / dtSec;
+  }
+  pidPrevEnc = encSnap;
+  pidHasPrevEnc = true;
+
+  // Also update global for feedback (best estimate)
+  measuredVelMps = pidMeasuredVel;
+  hasMeasuredVel = true;
+
   if (fabs(cmdSpeedMps) < 1e-4f) {
     resetSpeedPid();
     setMotorOutput(0);
     return;
   }
 
-  const float measured = hasMeasuredVel ? measuredVelMps : 0.0f;
   const float ffPwm = (float)speedMpsToPwm(cmdSpeedMps);
   float correction = 0.0f;
   if (ENABLE_SPEED_PID) {
-    correction = computeSpeedPidCorrection(cmdSpeedMps, measured, elapsedMs * 0.001f);
+    correction = computeSpeedPidCorrection(cmdSpeedMps, pidMeasuredVel,
+                                           (float)elapsedMs * 0.001f);
   }
 
   int targetPwm = (int)(ffPwm + correction);
@@ -406,7 +555,7 @@ void runSpeedController() {
     Serial.print("PID tgt=");
     Serial.print(cmdSpeedMps, 3);
     Serial.print(" vel=");
-    Serial.print(measured, 3);
+    Serial.print(pidMeasuredVel, 3);
     Serial.print(" ff=");
     Serial.print(ffPwm, 1);
     Serial.print(" corr=");
@@ -416,6 +565,9 @@ void runSpeedController() {
   }
 }
 
+// ================================================================
+//  Line handler & serial polling
+// ================================================================
 void handleLine(String line) {
   line.trim();
   if (line.length() == 0) return;
@@ -452,6 +604,9 @@ void pollJetsonSerial() {
   }
 }
 
+// ================================================================
+//  Safety timeout
+// ================================================================
 void safetyTimeoutCheck() {
   unsigned long nowMs = millis();
   if ((nowMs - lastCmdMs) > CMD_TIMEOUT_MS) {
@@ -466,6 +621,9 @@ void safetyTimeoutCheck() {
   }
 }
 
+// ================================================================
+//  Feedback (20 Hz to Jetson)
+// ================================================================
 void sendFeedback() {
   unsigned long nowMs = millis();
   if ((nowMs - lastFbMs) < FB_PERIOD_MS) return;
@@ -475,10 +633,11 @@ void sendFeedback() {
   static bool hasPrevEnc = false;
   static int32_t prevEnc = 0;
 
+  // [6] Use portENTER_CRITICAL instead of noInterrupts
   int32_t encSnapshot = 0;
-  noInterrupts();
+  portENTER_CRITICAL(&encMux);
   encSnapshot = encCount;
-  interrupts();
+  portEXIT_CRITICAL(&encMux);
 
   float estVel = 0.0f;
   const float dt = (prevFbMs == 0) ? 0.0f : ((float)(nowMs - prevFbMs) * 0.001f);
@@ -488,8 +647,12 @@ void sendFeedback() {
   }
   prevEnc = encSnapshot;
   hasPrevEnc = true;
-  measuredVelMps = estVel;
-  hasMeasuredVel = hasPrevEnc;
+
+  // [3] If PID is not running, update global from feedback measurement
+  if (!speedControlActive) {
+    measuredVelMps = estVel;
+    hasMeasuredVel = hasPrevEnc;
+  }
 
   JetsonSerial.print("FB vel_mps=");
   JetsonSerial.print(estVel, 3);
@@ -501,12 +664,15 @@ void sendFeedback() {
   JetsonSerial.print(" batt=0.0");
   JetsonSerial.println();
 
-  Serial.print("TX FB vel_mps="); 
+  Serial.print("TX FB vel_mps=");
   Serial.print(estVel, 3);
   Serial.print(" enc=");
   Serial.println(encSnapshot);
 }
 
+// ================================================================
+//  Setup & Loop
+// ================================================================
 void setup() {
   Serial.begin(115200);
   JetsonSerial.begin(115200, SERIAL_8N1, ESP_RX, ESP_TX);
@@ -516,13 +682,21 @@ void setup() {
   digitalWrite(ENA, HIGH);
   pinMode(ENC_A_PIN, INPUT);
   pinMode(ENC_B_PIN, INPUT);
-  encPrevState = (uint8_t)((digitalRead(ENC_A_PIN) << 1) | digitalRead(ENC_B_PIN));
+
+  // [2] Init encoder state from register
+  {
+    const uint32_t reg = GPIO.in1.val;
+    const uint8_t a = (uint8_t)((reg >> (ENC_A_PIN - 32)) & 1);
+    const uint8_t b = (uint8_t)((reg >> (ENC_B_PIN - 32)) & 1);
+    encPrevState = (uint8_t)((a << 1) | b);
+  }
   attachInterrupt(digitalPinToInterrupt(ENC_A_PIN), onEncoderEdge, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_B_PIN), onEncoderEdge, CHANGE);
 
-  // Motor PWM on IN1
+  // Motor PWM on IN1 — [1] 10-bit resolution
   ledcAttach(IN1, PWM_FREQ, PWM_RES);
   ledcWrite(IN1, 0);
+  shadowIN1 = 0;
 
   // Servo PWM on GPIO33
   ledcAttach(SERVO_PIN, SERVO_FREQ, SERVO_RES);
@@ -531,8 +705,9 @@ void setup() {
   stopMotor();
   lastCmdMs = millis();
   lastFbMs = 0;
+  lastRampMs = millis();
 
-  Serial.println("ESP32 ready (ROS2 bridge protocol + servo GPIO33).");
+  Serial.println("ESP32 ready (ROS2 bridge v2: 10-bit PWM, fast ISR, time-ramp, brake-dwell).");
   Serial.println("Expect: CMD spd=... steer=... estop=...");
   Serial.println("or:     CMD pwm=... steer_us=... estop=...");
   Serial.print("Encoder counts/m: ");
