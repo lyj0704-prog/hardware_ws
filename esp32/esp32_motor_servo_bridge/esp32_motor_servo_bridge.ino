@@ -17,15 +17,14 @@
 //   [7] Shadow register for ledcWrite (skip redundant writes)
 
 #include <HardwareSerial.h>
-#include <soc/gpio_struct.h>   // GPIO.in1.val direct register
 
 // ---------------- Pins ----------------
 const int ENA = 14;
 const int IN1 = 27;      // motor PWM
 const int IN2 = 26;      // motor DIR
 const int SERVO_PIN = 33;  // steering servo signal (yellow)
-const int ENC_A_PIN = 35;  // wheel encoder pulse input
-const int ENC_B_PIN = 34;  // quadrature B pin
+const int ENC_A_PIN = 18;  // wheel encoder pulse input
+const int ENC_B_PIN = 19;  // quadrature B pin
 const bool ENC_INVERT_SIGN = false;
 
 // UART2 (ESP32)
@@ -61,16 +60,16 @@ float MAX_STEER_RAD = 0.15f;
 // Must match ROS-side max_speed_mps in yaml
 float MAX_SPEED_MPS = 1.0f;
 int MIN_EFFECTIVE_PWM_FWD = 320;   // was 80
-int MIN_EFFECTIVE_PWM_REV = 80;    // softer reverse minimum duty
+int MIN_EFFECTIVE_PWM_REV = 25;    // lower reverse floor to avoid fixed fast reverse
 int MAX_USE_PWM_FWD = 600;         // was 200
-int MAX_USE_PWM_REV = 130;         // lower hard cap for gentler reverse
+int MAX_USE_PWM_REV = 110;         // tighter reverse cap
 int START_BOOST_PWM_FWD = 480;     // was 120
-int START_BOOST_PWM_REV = 0;       // disable reverse launch boost
+int START_BOOST_PWM_REV = 25;      // minimal reverse boost
 const unsigned long START_BOOST_MS = 140;
+const unsigned long START_BOOST_MS_REV = 0;
 
 // [4] Time-based ramp: PWM units per second (replaces fixed PWM_RAMP_STEP)
-float PWM_RAMP_RATE_FWD = 3000.0f; // ~0.33s from 0 to full forward
-float PWM_RAMP_RATE_REV = 900.0f;  // slower reverse ramp for smoother engagement
+float PWM_RAMP_RATE = 3000.0f;     // ~0.33s from 0 to full (was ~5/loop ≈ irregular)
 
 // [5] Brake dwell: hold brake this long before allowing direction reversal
 const unsigned long BRAKE_DWELL_MS = 80;
@@ -80,6 +79,7 @@ bool DIR_IN2_HIGH_IS_REVERSE = true;
 // ---------------- Speed PID ----------------
 // [1] Gains & clamps scaled ×4 for 10-bit PWM output
 const bool ENABLE_SPEED_PID = true;
+const bool USE_PID_IN_REVERSE = false;         // manual reverse: open-loop for stability
 const unsigned long SPEED_PID_PERIOD_MS = 20;  // 50 Hz control loop
 float SPEED_KP = 240.0f;                       // was 60
 float SPEED_KI = 40.0f;                        // was 20
@@ -87,18 +87,7 @@ float SPEED_KD = 8.0f;                         // was 2
 float SPEED_PID_I_CLAMP = 320.0f;              // was 80
 float SPEED_PID_D_LPF_ALPHA = 0.7f;
 float SPEED_PID_MAX_CORR_FWD = 180.0f;         // was 70
-float SPEED_PID_MAX_CORR_REV = 120.0f;         // keep reverse correction softer
-const float SPEED_PID_I_BLEED_WHEN_SAT = 0.92f; // anti-windup bleed on sustained saturation
-
-// Low-speed shaping to avoid reverse launch step near zero command.
-const float LOW_SPEED_BLEND_MPS = 0.12f;
-const int MIN_EFFECTIVE_PWM_REV_LOW = 30;      // allow softer reverse near zero speed
-
-// Guard: if measured velocity keeps opposite sign while actively driving, stop output.
-const bool ENABLE_SIGN_MISMATCH_GUARD = true;
-const float SIGN_GUARD_MIN_CMD_MPS = 0.12f;
-const float SIGN_GUARD_MIN_VEL_MPS = 0.06f;
-const int SIGN_MISMATCH_TRIP_COUNT = 25;       // 25 * 20ms = 0.5s
+float SPEED_PID_MAX_CORR_REV = 80.0f;          // limit reverse correction burst
 
 // ---------------- State ----------------
 String rxLine;
@@ -110,16 +99,8 @@ bool estopLatched = false;
 bool motorRunning = false;
 volatile int currentPwm = 0;
 
-// Encoder model (for m/s conversion). Update ENCODER_CPR_MOTOR if your encoder differs.
-const float WHEEL_RADIUS_M = 0.05f;        // must match ROS wheel_radius_m
-const float GEAR_RATIO = 8.27f;            // gearbox ratio (motor:wheel)
-const int ENCODER_CPR_MOTOR = 11;          // pulses per motor rev (single channel)
-const int ENCODER_QUAD_FACTOR = 4;         // quadrature decoding factor
-const float PI_F = 3.14159265358979323846f;
-const float ENC_COUNTS_PER_WHEEL_REV =
-    (float)(ENCODER_CPR_MOTOR * ENCODER_QUAD_FACTOR) * GEAR_RATIO;
-float ENC_COUNTS_PER_METER =
-    ENC_COUNTS_PER_WHEEL_REV / (2.0f * PI_F * WHEEL_RADIUS_M);
+// Encoder calibration: replace with measured value.
+float ENC_COUNTS_PER_METER = 541.1f;
 volatile int32_t encCount = 0;
 volatile uint8_t encPrevState = 0;
 
@@ -137,7 +118,6 @@ unsigned long lastSpeedPidMs = 0;
 float speedPidIntegral = 0.0f;
 float speedPidPrevError = 0.0f;
 float speedPidDerivFilt = 0.0f;
-int speedSignMismatchCount = 0;
 
 // [3] Independent encoder snapshot for PID velocity
 int32_t pidPrevEnc = 0;
@@ -159,7 +139,7 @@ const unsigned long CMD_TIMEOUT_MS = 300;
 const unsigned long FB_PERIOD_MS = 50; // 20Hz feedback
 
 // ================================================================
-//  [2] Encoder ISR — direct register read (GPIO 34, 35 are in GPIO.in1)
+//  [2] Encoder ISR
 // ================================================================
 void IRAM_ATTR onEncoderEdge() {
   static const int8_t QUAD_TABLE[16] = {
@@ -168,11 +148,8 @@ void IRAM_ATTR onEncoderEdge() {
       -1, 0, 0, +1,
       0, +1, -1, 0};
 
-  // [2] Direct register read: GPIO 32-39 → GPIO.in1.val
-  // GPIO 34 = bit 2, GPIO 35 = bit 3
-  const uint32_t reg = GPIO.in1.val;
-  const uint8_t a = (uint8_t)((reg >> (ENC_A_PIN - 32)) & 1);  // bit 3
-  const uint8_t b = (uint8_t)((reg >> (ENC_B_PIN - 32)) & 1);  // bit 2
+  const uint8_t a = (uint8_t)digitalRead(ENC_A_PIN);
+  const uint8_t b = (uint8_t)digitalRead(ENC_B_PIN);
 
   const uint8_t curr = (uint8_t)((a << 1) | b);
   const uint8_t idx = (uint8_t)((encPrevState << 2) | curr);
@@ -288,7 +265,7 @@ void setMotorOutput(int signedPwm) {
   // Start boost for breaking static friction from standstill
   if (currentPwm == 0 && signedPwm != 0) {
     startBoostSign = (signedPwm > 0) ? 1 : -1;
-    startBoostUntilMs = nowMs + START_BOOST_MS;
+    startBoostUntilMs = nowMs + ((signedPwm > 0) ? START_BOOST_MS : START_BOOST_MS_REV);
   }
 
   // ---- [4] Time-based ramping ----
@@ -296,8 +273,7 @@ void setMotorOutput(int signedPwm) {
   if (lastRampMs > 0) {
     const unsigned long dtMs = nowMs - lastRampMs;
     if (dtMs > 0) {
-      const float rampRate = (targetPwm < 0) ? PWM_RAMP_RATE_REV : PWM_RAMP_RATE_FWD;
-      const float maxDelta = rampRate * (float)dtMs * 0.001f;
+      const float maxDelta = PWM_RAMP_RATE * (float)dtMs * 0.001f;
       const int iMaxDelta = (int)maxDelta;
       if (iMaxDelta > 0) {
         int delta = targetPwm - currentPwm;
@@ -318,7 +294,7 @@ void setMotorOutput(int signedPwm) {
         targetPwm = START_BOOST_PWM_FWD;
       }
     } else if (startBoostSign < 0) {
-      if (START_BOOST_PWM_REV > 0 && targetPwm > -START_BOOST_PWM_REV) {
+      if (targetPwm > -START_BOOST_PWM_REV) {
         targetPwm = -START_BOOST_PWM_REV;
       }
     }
@@ -361,7 +337,6 @@ void resetSpeedPid() {
   speedPidIntegral = 0.0f;
   speedPidPrevError = 0.0f;
   speedPidDerivFilt = 0.0f;
-  speedSignMismatchCount = 0;
   lastSpeedPidMs = 0;
   pidHasPrevEnc = false;
 }
@@ -374,29 +349,15 @@ float computeSpeedPidCorrection(float targetMps, float currentMps, float dtSec) 
   const float error = targetMps - currentMps;
   const float p = SPEED_KP * error;
 
-  // Conditional integration anti-windup: freeze I when correction saturates and
-  // error would push farther into saturation.
-  float candIntegral = speedPidIntegral + error * dtSec;
-  candIntegral = constrain(candIntegral, -SPEED_PID_I_CLAMP, SPEED_PID_I_CLAMP);
-  const float iCand = SPEED_KI * candIntegral;
+  speedPidIntegral += error * dtSec;
+  speedPidIntegral = constrain(speedPidIntegral, -SPEED_PID_I_CLAMP, SPEED_PID_I_CLAMP);
+  const float i = SPEED_KI * speedPidIntegral;
 
   const float derivRaw = (error - speedPidPrevError) / dtSec;
   speedPidDerivFilt =
       SPEED_PID_D_LPF_ALPHA * speedPidDerivFilt + (1.0f - SPEED_PID_D_LPF_ALPHA) * derivRaw;
   const float d = SPEED_KD * speedPidDerivFilt;
 
-  const float rawWithCandI = p + iCand + d;
-  const bool satHigh = (rawWithCandI > SPEED_PID_MAX_CORR_FWD);
-  const bool satLow = (rawWithCandI < -SPEED_PID_MAX_CORR_REV);
-  const bool pushFurtherHigh = satHigh && (error > 0.0f);
-  const bool pushFurtherLow = satLow && (error < 0.0f);
-  if (!(pushFurtherHigh || pushFurtherLow)) {
-    speedPidIntegral = candIntegral;
-  } else {
-    speedPidIntegral *= SPEED_PID_I_BLEED_WHEN_SAT;
-  }
-
-  const float i = SPEED_KI * speedPidIntegral;
   speedPidPrevError = error;
   float corr = p + i + d;
   corr = constrain(corr, -SPEED_PID_MAX_CORR_REV, SPEED_PID_MAX_CORR_FWD);
@@ -466,8 +427,7 @@ void handleCmdMpsRad(const String& line) {
   (void)parseFloatField(line, "steer", steer);
   (void)parseIntField(line, "estop", estop);
 
-  // Clamp incoming target so both feedforward and PID use the same bounded speed target.
-  cmdSpeedMps = constrain(spd, -MAX_SPEED_MPS, MAX_SPEED_MPS);
+  cmdSpeedMps = spd;
   cmdSteerRad = INVERT_STEER_SIGN ? -steer : steer;
   estopLatched = (estop != 0);
   lastCmdMs = millis();
@@ -571,28 +531,6 @@ void runSpeedController() {
   measuredVelMps = pidMeasuredVel;
   hasMeasuredVel = true;
 
-  // Encoder sign/signal guard: if velocity sign keeps opposing command while motor
-  // is actively driving commanded direction, stop to avoid runaway.
-  if (ENABLE_SIGN_MISMATCH_GUARD) {
-    const bool cmdStrong = fabs(cmdSpeedMps) >= SIGN_GUARD_MIN_CMD_MPS;
-    const bool velStrong = fabs(pidMeasuredVel) >= SIGN_GUARD_MIN_VEL_MPS;
-    const bool oppositeSign = (cmdSpeedMps * pidMeasuredVel) < 0.0f;
-    const bool drivingCmdDirection =
-        (currentPwm != 0) && ((currentPwm > 0) == (cmdSpeedMps > 0));
-    if (cmdStrong && velStrong && oppositeSign && drivingCmdDirection) {
-      if (speedSignMismatchCount < 32767) speedSignMismatchCount++;
-    } else if (speedSignMismatchCount > 0) {
-      speedSignMismatchCount--;
-    }
-
-    if (speedSignMismatchCount >= SIGN_MISMATCH_TRIP_COUNT) {
-      Serial.println("WARN: encoder sign mismatch guard tripped; stopping motor.");
-      stopMotor();
-      resetSpeedPid();
-      return;
-    }
-  }
-
   if (fabs(cmdSpeedMps) < 1e-4f) {
     resetSpeedPid();
     setMotorOutput(0);
@@ -601,23 +539,19 @@ void runSpeedController() {
 
   const float ffPwm = (float)speedMpsToPwm(cmdSpeedMps);
   float correction = 0.0f;
-  if (ENABLE_SPEED_PID) {
+  const bool isReverseCmd = (cmdSpeedMps < 0.0f);
+  const bool allowPid = ENABLE_SPEED_PID && (!isReverseCmd || USE_PID_IN_REVERSE);
+  if (allowPid) {
     correction = computeSpeedPidCorrection(cmdSpeedMps, pidMeasuredVel,
                                            (float)elapsedMs * 0.001f);
+  } else {
+    // Prevent residual integral push when reverse PID is disabled.
+    speedPidIntegral = 0.0f;
+    speedPidPrevError = 0.0f;
+    speedPidDerivFilt = 0.0f;
   }
 
   int targetPwm = (int)(ffPwm + correction);
-
-  // Soft low-speed reverse floor: avoid abrupt jump to full reverse minimum PWM.
-  if (targetPwm < 0 && fabs(cmdSpeedMps) < LOW_SPEED_BLEND_MPS) {
-    const float t = constrain(fabs(cmdSpeedMps) / LOW_SPEED_BLEND_MPS, 0.0f, 1.0f);
-    const int dynMinRev =
-        MIN_EFFECTIVE_PWM_REV_LOW + (int)((float)(MIN_EFFECTIVE_PWM_REV - MIN_EFFECTIVE_PWM_REV_LOW) * t);
-    if ((-targetPwm) < dynMinRev) {
-      targetPwm = -dynMinRev;
-    }
-  }
-
   setMotorOutput(targetPwm);
 
   static unsigned long lastLogMs = 0;
@@ -712,8 +646,9 @@ void sendFeedback() {
 
   float estVel = 0.0f;
   const float dt = (prevFbMs == 0) ? 0.0f : ((float)(nowMs - prevFbMs) * 0.001f);
+  int32_t dCount = 0;
   if (hasPrevEnc && dt > 1e-4f && ENC_COUNTS_PER_METER > 1e-4f) {
-    const int32_t dCount = encSnapshot - prevEnc;
+    dCount = encSnapshot - prevEnc;
     estVel = ((float)dCount / ENC_COUNTS_PER_METER) / dt;
   }
   prevEnc = encSnapshot;
@@ -738,7 +673,9 @@ void sendFeedback() {
   Serial.print("TX FB vel_mps=");
   Serial.print(estVel, 3);
   Serial.print(" enc=");
-  Serial.println(encSnapshot);
+  Serial.print(encSnapshot);
+  Serial.print(" dCount=");
+  Serial.println(dCount);
 }
 
 // ================================================================
@@ -754,11 +691,10 @@ void setup() {
   pinMode(ENC_A_PIN, INPUT);
   pinMode(ENC_B_PIN, INPUT);
 
-  // [2] Init encoder state from register
+  // [2] Init encoder state
   {
-    const uint32_t reg = GPIO.in1.val;
-    const uint8_t a = (uint8_t)((reg >> (ENC_A_PIN - 32)) & 1);
-    const uint8_t b = (uint8_t)((reg >> (ENC_B_PIN - 32)) & 1);
+    const uint8_t a = (uint8_t)digitalRead(ENC_A_PIN);
+    const uint8_t b = (uint8_t)digitalRead(ENC_B_PIN);
     encPrevState = (uint8_t)((a << 1) | b);
   }
   attachInterrupt(digitalPinToInterrupt(ENC_A_PIN), onEncoderEdge, CHANGE);
@@ -781,12 +717,11 @@ void setup() {
   Serial.println("ESP32 ready (ROS2 bridge v2: 10-bit PWM, fast ISR, time-ramp, brake-dwell).");
   Serial.println("Expect: CMD spd=... steer=... estop=...");
   Serial.println("or:     CMD pwm=... steer_us=... estop=...");
-  Serial.print("Gear ratio (motor:wheel): ");
-  Serial.println(GEAR_RATIO, 2);
-  Serial.print("Encoder counts/wheel rev: ");
-  Serial.println(ENC_COUNTS_PER_WHEEL_REV, 2);
   Serial.print("Encoder counts/m: ");
   Serial.println(ENC_COUNTS_PER_METER, 3);
+  Serial.printf("CFG max=%.3f rev_max=%d rev_min=%d rev_boost=%d pid_rev=%d\n",
+                MAX_SPEED_MPS, MAX_USE_PWM_REV, MIN_EFFECTIVE_PWM_REV,
+                START_BOOST_PWM_REV, USE_PID_IN_REVERSE ? 1 : 0);
   JetsonSerial.println("FB fault=0");
 }
 
