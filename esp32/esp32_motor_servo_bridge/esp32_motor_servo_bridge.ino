@@ -61,11 +61,11 @@ float MAX_STEER_RAD = 0.15f;
 // Must match ROS-side max_speed_mps in yaml
 float MAX_SPEED_MPS = 1.0f;
 int MIN_EFFECTIVE_PWM_FWD = 320;   // was 80
-int MIN_EFFECTIVE_PWM_REV = 240;   // was 60
-int MAX_USE_PWM_FWD = 800;         // was 200
-int MAX_USE_PWM_REV = 440;         // was 110
+int MIN_EFFECTIVE_PWM_REV = 120;   // lowered to reduce reverse launch jerk
+int MAX_USE_PWM_FWD = 600;         // was 200
+int MAX_USE_PWM_REV = 180;         // hard cap reverse speed
 int START_BOOST_PWM_FWD = 480;     // was 120
-int START_BOOST_PWM_REV = 360;     // was 90
+int START_BOOST_PWM_REV = 150;     // softer reverse breakaway boost
 const unsigned long START_BOOST_MS = 140;
 
 // [4] Time-based ramp: PWM units per second (replaces fixed PWM_RAMP_STEP)
@@ -81,11 +81,11 @@ bool DIR_IN2_HIGH_IS_REVERSE = true;
 const bool ENABLE_SPEED_PID = true;
 const unsigned long SPEED_PID_PERIOD_MS = 20;  // 50 Hz control loop
 float SPEED_KP = 240.0f;                       // was 60
-float SPEED_KI = 80.0f;                        // was 20
+float SPEED_KI = 40.0f;                        // was 20
 float SPEED_KD = 8.0f;                         // was 2
 float SPEED_PID_I_CLAMP = 320.0f;              // was 80
 float SPEED_PID_D_LPF_ALPHA = 0.7f;
-float SPEED_PID_MAX_CORR_FWD = 280.0f;         // was 70
+float SPEED_PID_MAX_CORR_FWD = 180.0f;         // was 70
 float SPEED_PID_MAX_CORR_REV = 200.0f;         // was 50
 
 // ---------------- State ----------------
