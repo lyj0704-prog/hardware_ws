@@ -10,9 +10,9 @@ motor_serial_bridge_node:
 
     wheel_base_m: 0.33
     wheel_radius_m: 0.05
-    ticks_per_rev: 2048
+    ticks_per_rev: 364   # 11 CPR * quadrature(4x) * gear ratio(8.27) ~= 363.88
 
-    max_speed_mps: 5.0
+    max_speed_mps: 1.0   # keep consistent with ESP32 MAX_SPEED_MPS
     max_steer_rad: 0.23
 
     drive_model: "ackermann"
