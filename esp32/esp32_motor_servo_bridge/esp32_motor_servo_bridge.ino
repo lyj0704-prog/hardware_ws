@@ -4,7 +4,7 @@
 // TX: "FB vel_mps=0.48 steer=0.10 enc=12345 fault=0"
 //
 // Hardware:
-// - 1 DC motor (IN1=PWM, IN2=DIR, ENA=enable)  [L298N]
+// - 1 DC motor driver (MD10C style: PWM + DIR)
 // - 1 steering servo on GPIO33
 //
 // v2 changes (software-only, no hardware change):
@@ -19,9 +19,8 @@
 #include <HardwareSerial.h>
 
 // ---------------- Pins ----------------
-const int ENA = 14;
-const int IN1 = 27;      // motor PWM
-const int IN2 = 26;      // motor DIR
+const int PWM_PIN = 14;  // motor PWM (MD10C PWM)
+const int DIR_PIN = 27;  // motor DIR (MD10C DIR)
 const int SERVO_PIN = 33;  // steering servo signal (yellow)
 const int ENC_A_PIN = 18;  // wheel encoder pulse input
 const int ENC_B_PIN = 19;  // quadrature B pin
@@ -74,7 +73,7 @@ float PWM_RAMP_RATE = 3000.0f;     // ~0.33s from 0 to full (was ~5/loop ≈ irr
 // [5] Brake dwell: hold brake this long before allowing direction reversal
 const unsigned long BRAKE_DWELL_MS = 80;
 
-bool DIR_IN2_HIGH_IS_REVERSE = true;
+bool DIR_HIGH_IS_REVERSE = true;
 
 // ---------------- Speed PID ----------------
 // [1] Gains & clamps scaled ×4 for 10-bit PWM output
@@ -131,7 +130,7 @@ bool brakeDwellActive = false;
 unsigned long brakeDwellUntilMs = 0;
 
 // [7] Shadow registers for ledcWrite (skip redundant writes)
-uint32_t shadowIN1 = 0;
+uint32_t shadowPwm = 0;
 uint32_t shadowServo = 0;
 
 // ESP32-side safety timeout (independent of Jetson timeout)
@@ -165,10 +164,10 @@ void IRAM_ATTR onEncoderEdge() {
 // ================================================================
 //  [7] Shadow-guarded ledcWrite helpers
 // ================================================================
-static inline void safeWriteIN1(uint32_t duty) {
-  if (duty != shadowIN1) {
-    ledcWrite(IN1, duty);
-    shadowIN1 = duty;
+static inline void safeWritePwm(uint32_t duty) {
+  if (duty != shadowPwm) {
+    ledcWrite(PWM_PIN, duty);
+    shadowPwm = duty;
   }
 }
 
@@ -218,9 +217,9 @@ void setMotorOutput(int signedPwm) {
   // ---- [5] Brake dwell: if active, hold brake until timer expires ----
   if (brakeDwellActive) {
     if (nowMs < brakeDwellUntilMs) {
-      // Still dwelling — keep brake (IN1 LOW + IN2 LOW + ENA HIGH = L298N short brake)
-      safeWriteIN1(0);
-      digitalWrite(IN2, LOW);
+      // Still dwelling — keep motor output disabled for dwell window.
+      safeWritePwm(0);
+      digitalWrite(DIR_PIN, LOW);
       currentPwm = 0;
       motorRunning = false;
       return;
@@ -248,9 +247,9 @@ void setMotorOutput(int signedPwm) {
     bool wasForward = (currentPwm > 0);
     bool wantForward = (signedPwm > 0);
     if (wasForward != wantForward) {
-      // Direction change at non-zero speed: brake first
-      safeWriteIN1(0);
-      digitalWrite(IN2, LOW);
+      // Direction change at non-zero speed: force stop first, then dwell.
+      safeWritePwm(0);
+      digitalWrite(DIR_PIN, LOW);
       currentPwm = 0;
       motorRunning = false;
       startBoostUntilMs = 0;
@@ -302,8 +301,8 @@ void setMotorOutput(int signedPwm) {
 
   // ---- Stop ----
   if (targetPwm == 0) {
-    safeWriteIN1(0);          // [7] shadow guard
-    digitalWrite(IN2, LOW);   // IN1=LOW, IN2=LOW, ENA=HIGH → L298N short brake
+    safeWritePwm(0);          // [7] shadow guard
+    digitalWrite(DIR_PIN, LOW);
     currentPwm = 0;
     motorRunning = false;
     startBoostUntilMs = 0;
@@ -315,13 +314,13 @@ void setMotorOutput(int signedPwm) {
   bool reverse = targetPwm < 0;
   int pwm = abs(targetPwm);
 
-  if (DIR_IN2_HIGH_IS_REVERSE) {
-    digitalWrite(IN2, reverse ? HIGH : LOW);
+  if (DIR_HIGH_IS_REVERSE) {
+    digitalWrite(DIR_PIN, reverse ? HIGH : LOW);
   } else {
-    digitalWrite(IN2, reverse ? LOW : HIGH);
+    digitalWrite(DIR_PIN, reverse ? LOW : HIGH);
   }
 
-  safeWriteIN1(pwm);           // [7] shadow guard
+  safeWritePwm(pwm);           // [7] shadow guard
   currentPwm = reverse ? -pwm : pwm;
   motorRunning = true;
 }
@@ -685,9 +684,8 @@ void setup() {
   Serial.begin(115200);
   JetsonSerial.begin(115200, SERIAL_8N1, ESP_RX, ESP_TX);
 
-  pinMode(ENA, OUTPUT);
-  pinMode(IN2, OUTPUT);
-  digitalWrite(ENA, HIGH);
+  pinMode(DIR_PIN, OUTPUT);
+  digitalWrite(DIR_PIN, LOW);
   pinMode(ENC_A_PIN, INPUT);
   pinMode(ENC_B_PIN, INPUT);
 
@@ -700,10 +698,10 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENC_A_PIN), onEncoderEdge, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_B_PIN), onEncoderEdge, CHANGE);
 
-  // Motor PWM on IN1 — [1] 10-bit resolution
-  ledcAttach(IN1, PWM_FREQ, PWM_RES);
-  ledcWrite(IN1, 0);
-  shadowIN1 = 0;
+  // Motor PWM on PWM_PIN — [1] 10-bit resolution
+  ledcAttach(PWM_PIN, PWM_FREQ, PWM_RES);
+  ledcWrite(PWM_PIN, 0);
+  shadowPwm = 0;
 
   // Servo PWM on GPIO33
   ledcAttach(SERVO_PIN, SERVO_FREQ, SERVO_RES);
